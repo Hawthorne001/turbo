@@ -1,33 +1,37 @@
-use std::cell::OnceCell;
+use std::{cell::OnceCell, time::Duration};
 
 use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf};
 use turborepo_api_client::{APIAuth, APIClient};
 use turborepo_auth::{TURBO_TOKEN_DIR, TURBO_TOKEN_FILE};
 use turborepo_dirs::config_dir;
-use turborepo_ui::UI;
+use turborepo_ui::ColorConfig;
 
 use crate::{
+    cli::Command,
     config::{ConfigurationOptions, Error as ConfigError, TurborepoConfigBuilder},
+    turbo_json::UIMode,
     Args,
 };
 
 pub(crate) mod bin;
+pub(crate) mod config;
 pub(crate) mod daemon;
 pub(crate) mod generate;
-pub(crate) mod info;
 pub(crate) mod link;
 pub(crate) mod login;
 pub(crate) mod logout;
+pub(crate) mod ls;
 pub(crate) mod prune;
+pub(crate) mod query;
 pub(crate) mod run;
 pub(crate) mod scan;
 pub(crate) mod telemetry;
 pub(crate) mod unlink;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommandBase {
     pub repo_root: AbsoluteSystemPathBuf,
-    pub ui: UI,
+    pub color_config: ColorConfig,
     #[cfg(test)]
     pub global_config_path: Option<AbsoluteSystemPathBuf>,
     config: OnceCell<ConfigurationOptions>,
@@ -40,11 +44,11 @@ impl CommandBase {
         args: Args,
         repo_root: AbsoluteSystemPathBuf,
         version: &'static str,
-        ui: UI,
+        color_config: ColorConfig,
     ) -> Self {
         Self {
             repo_root,
-            ui,
+            color_config,
             args,
             #[cfg(test)]
             global_config_path: None,
@@ -68,6 +72,53 @@ impl CommandBase {
             .with_token(self.args.token.clone())
             .with_timeout(self.args.remote_cache_timeout)
             .with_preflight(self.args.preflight.then_some(true))
+            .with_ui(self.args.ui.or_else(|| {
+                self.args.execution_args.as_ref().and_then(|args| {
+                    if !args.log_order.compatible_with_tui() {
+                        Some(UIMode::Stream)
+                    } else {
+                        // If the argument is compatible with the TUI this does not mean we should
+                        // override other configs
+                        None
+                    }
+                })
+            }))
+            .with_allow_no_package_manager(
+                self.args
+                    .dangerously_disable_package_manager_check
+                    .then_some(true),
+            )
+            .with_daemon(self.args.run_args.as_ref().and_then(|args| args.daemon()))
+            .with_env_mode(
+                self.args
+                    .command
+                    .as_ref()
+                    .and_then(|c| match c {
+                        Command::Run { execution_args, .. } => execution_args.env_mode,
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        self.args
+                            .execution_args
+                            .as_ref()
+                            .and_then(|args| args.env_mode)
+                    }),
+            )
+            .with_cache_dir(
+                self.args
+                    .command
+                    .as_ref()
+                    .and_then(|c| match c {
+                        Command::Run { execution_args, .. } => execution_args.cache_dir.clone(),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        self.args
+                            .execution_args
+                            .as_ref()
+                            .and_then(|args| args.cache_dir.clone())
+                    }),
+            )
             .build()
     }
 
@@ -116,13 +167,32 @@ impl CommandBase {
         &self.args
     }
 
+    pub fn args_mut(&mut self) -> &mut Args {
+        &mut self.args
+    }
+
     pub fn api_client(&self) -> Result<APIClient, ConfigError> {
         let config = self.config()?;
         let api_url = config.api_url();
         let timeout = config.timeout();
+        let upload_timeout = config.upload_timeout();
 
-        APIClient::new(api_url, timeout, self.version, config.preflight())
-            .map_err(ConfigError::ApiClient)
+        APIClient::new(
+            api_url,
+            if timeout > 0 {
+                Some(Duration::from_secs(timeout))
+            } else {
+                None
+            },
+            if upload_timeout > 0 {
+                Some(Duration::from_secs(upload_timeout))
+            } else {
+                None
+            },
+            self.version,
+            config.preflight(),
+        )
+        .map_err(ConfigError::ApiClient)
     }
 
     /// Current working directory for the turbo command

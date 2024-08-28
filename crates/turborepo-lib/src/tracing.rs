@@ -22,7 +22,7 @@ use tracing_subscriber::{
     reload::{self, Handle},
     EnvFilter, Layer, Registry,
 };
-use turborepo_ui::UI;
+use turborepo_ui::ColorConfig;
 
 // a lot of types to make sure we record the right relationships
 
@@ -99,10 +99,10 @@ impl TurboSubscriber {
     ///
     /// `TurboSubscriber` has optional loggers that can be enabled later:
     /// - `set_daemon_logger` enables logging to a file, using the standard
-    ///  formatter.
+    ///   formatter.
     /// - `enable_chrome_tracing` enables logging to a file, using the chrome
-    ///  tracing formatter.
-    pub fn new_with_verbosity(verbosity: usize, ui: &UI) -> Self {
+    ///   tracing formatter.
+    pub fn new_with_verbosity(verbosity: usize, color_config: &ColorConfig) -> Self {
         let level_override = match verbosity {
             0 => None,
             1 => Some(LevelFilter::INFO),
@@ -128,7 +128,9 @@ impl TurboSubscriber {
 
         let stderr = fmt::layer()
             .with_writer(StdErrWrapper {})
-            .event_format(TurboFormatter::new_with_ansi(!ui.should_strip_ansi))
+            .event_format(TurboFormatter::new_with_ansi(
+                !color_config.should_strip_ansi,
+            ))
             .with_filter(env_filter(LevelFilter::WARN));
 
         // we set this layer to None to start with, effectively disabling it

@@ -1,7 +1,7 @@
 mod change_detector;
 mod filter;
 mod simple_glob;
-mod target_selector;
+pub mod target_selector;
 
 use std::collections::HashSet;
 
@@ -33,5 +33,5 @@ pub fn resolve_packages(
         scm,
         root_turbo_json,
     )?
-    .resolve(&opts.get_filters())
+    .resolve(&opts.affected_range, &opts.get_filters())
 }

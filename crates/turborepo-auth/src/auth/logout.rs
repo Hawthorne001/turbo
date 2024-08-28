@@ -15,7 +15,7 @@ pub async fn logout<T: TokenClient>(options: &LogoutOptions<T>) -> Result<(), Er
         return Err(err);
     }
 
-    cprintln!(options.ui, GREY, ">>> Logged out");
+    cprintln!(options.color_config, GREY, ">>> Logged out");
     Ok(())
 }
 
@@ -82,12 +82,11 @@ impl<T: TokenClient> LogoutOptions<T> {
 mod tests {
     use std::backtrace::Backtrace;
 
-    use async_trait::async_trait;
     use reqwest::{RequestBuilder, Response};
     use tempfile::tempdir;
     use turbopath::AbsoluteSystemPathBuf;
     use turborepo_api_client::Client;
-    use turborepo_ui::UI;
+    use turborepo_ui::ColorConfig;
     use turborepo_vercel_api::{
         token::ResponseTokenMetadata, SpacesResponse, Team, TeamsResponse, UserResponse,
         VerifiedSsoUser,
@@ -100,7 +99,6 @@ mod tests {
         pub succeed_delete_request: bool,
     }
 
-    #[async_trait]
     impl Client for MockApiClient {
         async fn get_user(&self, _token: &str) -> turborepo_api_client::Result<UserResponse> {
             unimplemented!("get_user")
@@ -143,7 +141,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TokenClient for MockApiClient {
         async fn delete_token(&self, _token: &str) -> turborepo_api_client::Result<()> {
             if self.succeed_delete_request {
@@ -174,7 +171,7 @@ mod tests {
             .expect("could not create file");
 
         let logout_options = LogoutOptions {
-            ui: UI::new(false),
+            color_config: ColorConfig::new(false),
             api_client: MockApiClient {
                 succeed_delete_request: true,
             },
@@ -202,7 +199,7 @@ mod tests {
         };
 
         let options = LogoutOptions {
-            ui: UI::new(false),
+            color_config: ColorConfig::new(false),
             api_client,
             path: Some(path.clone()),
             invalidate: true,

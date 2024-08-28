@@ -6,6 +6,7 @@ use std::collections::HashSet;
 pub use package::{
     DefaultPackageChangeMapper, GlobalDepsPackageChangeMapper, PackageChangeMapper, PackageMapping,
 };
+use tracing::debug;
 use turbopath::{AbsoluteSystemPath, AnchoredSystemPathBuf};
 use wax::Program;
 
@@ -23,8 +24,17 @@ pub enum LockfileChange {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum AllPackageChangeReason {
+    DefaultGlobalFileChanged,
+    LockfileChangeDetectionFailed,
+    LockfileChangedWithoutDetails,
+    RootInternalDepChanged,
+    NonPackageFileChanged,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum PackageChanges {
-    All,
+    All(AllPackageChangeReason),
     Some(HashSet<WorkspacePackage>),
 }
 
@@ -60,31 +70,51 @@ impl<'a, PD: PackageChangeMapper> ChangeMapper<'a, PD> {
         lockfile_change: Option<LockfileChange>,
     ) -> Result<PackageChanges, ChangeMapError> {
         if Self::default_global_file_changed(&changed_files) {
-            return Ok(PackageChanges::All);
+            debug!("global file changed");
+            return Ok(PackageChanges::All(
+                AllPackageChangeReason::DefaultGlobalFileChanged,
+            ));
         }
 
         // get filtered files and add the packages that contain them
         let filtered_changed_files = self.filter_ignored_files(changed_files.iter())?;
-        let PackageChanges::Some(mut changed_pkgs) =
-            self.get_changed_packages(filtered_changed_files.into_iter())?
-        else {
-            return Ok(PackageChanges::All);
-        };
 
-        match lockfile_change {
-            Some(LockfileChange::WithContent(content)) => {
-                // if we run into issues, don't error, just assume all packages have changed
-                let Ok(lockfile_changes) = self.get_changed_packages_from_lockfile(content) else {
-                    return Ok(PackageChanges::All);
-                };
+        match self.get_changed_packages(filtered_changed_files.into_iter()) {
+            PackageChanges::All(reason) => Ok(PackageChanges::All(reason)),
 
-                changed_pkgs.extend(lockfile_changes);
+            PackageChanges::Some(mut changed_pkgs) => {
+                match lockfile_change {
+                    Some(LockfileChange::WithContent(content)) => {
+                        // if we run into issues, don't error, just assume all packages have changed
+                        let Ok(lockfile_changes) = self.get_changed_packages_from_lockfile(content)
+                        else {
+                            debug!(
+                                "unable to determine lockfile changes, assuming all packages \
+                                 changed"
+                            );
+                            return Ok(PackageChanges::All(
+                                AllPackageChangeReason::LockfileChangeDetectionFailed,
+                            ));
+                        };
+                        debug!(
+                            "found {} packages changed by lockfile",
+                            lockfile_changes.len()
+                        );
+                        changed_pkgs.extend(lockfile_changes);
 
-                Ok(PackageChanges::Some(changed_pkgs))
+                        Ok(PackageChanges::Some(changed_pkgs))
+                    }
+
+                    // We don't have the actual contents, so just invalidate everything
+                    Some(LockfileChange::Empty) => {
+                        debug!("no previous lockfile available, assuming all packages changed");
+                        Ok(PackageChanges::All(
+                            AllPackageChangeReason::LockfileChangedWithoutDetails,
+                        ))
+                    }
+                    None => Ok(PackageChanges::Some(changed_pkgs)),
+                }
             }
-            // We don't have the actual contents, so just invalidate everything
-            Some(LockfileChange::Empty) => Ok(PackageChanges::All),
-            None => Ok(PackageChanges::Some(changed_pkgs)),
         }
     }
 
@@ -102,21 +132,35 @@ impl<'a, PD: PackageChangeMapper> ChangeMapper<'a, PD> {
     fn get_changed_packages<'b>(
         &self,
         files: impl Iterator<Item = &'b AnchoredSystemPathBuf>,
-    ) -> Result<PackageChanges, turborepo_scm::Error> {
+    ) -> PackageChanges {
+        let root_internal_deps = self.pkg_graph.root_internal_package_dependencies();
         let mut changed_packages = HashSet::new();
         for file in files {
             match self.package_detector.detect_package(file) {
+                // Internal root dependency changed so global hash has changed
+                PackageMapping::Package(pkg) if root_internal_deps.contains(&pkg) => {
+                    debug!(
+                        "{} changes root internal dependency: \"{}\"\nshortest path from root: \
+                         {:?}",
+                        file.to_string(),
+                        pkg.name,
+                        self.pkg_graph.root_internal_dependency_explanation(&pkg),
+                    );
+                    return PackageChanges::All(AllPackageChangeReason::RootInternalDepChanged);
+                }
                 PackageMapping::Package(pkg) => {
+                    debug!("{} changes \"{}\"", file.to_string(), pkg.name);
                     changed_packages.insert(pkg);
                 }
                 PackageMapping::All => {
-                    return Ok(PackageChanges::All);
+                    debug!("all packages changed due to {file:?}");
+                    return PackageChanges::All(AllPackageChangeReason::NonPackageFileChanged);
                 }
                 PackageMapping::None => {}
             }
         }
 
-        Ok(PackageChanges::Some(changed_packages))
+        PackageChanges::Some(changed_packages)
     }
 
     fn get_changed_packages_from_lockfile(
@@ -150,8 +194,6 @@ impl<'a, PD: PackageChangeMapper> ChangeMapper<'a, PD> {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ChangeMapError {
-    #[error("SCM error: {0}")]
-    Scm(#[from] turborepo_scm::Error),
     #[error(transparent)]
     Wax(#[from] wax::BuildError),
     #[error("Package manager error: {0}")]

@@ -1,18 +1,22 @@
-use std::{collections::HashMap, ffi::OsString, io};
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    io,
+};
 
+use camino::{Utf8Path, Utf8PathBuf};
 use convert_case::{Case, Casing};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde::Deserialize;
 use struct_iterable::Iterable;
 use thiserror::Error;
-use turbopath::{AbsoluteSystemPathBuf, AnchoredSystemPath};
+use turbopath::{AbsoluteSystemPathBuf, AnchoredSystemPath, RelativeUnixPath};
 use turborepo_auth::{TURBO_TOKEN_DIR, TURBO_TOKEN_FILE, VERCEL_TOKEN_DIR, VERCEL_TOKEN_FILE};
 use turborepo_dirs::{config_dir, vercel_config_dir};
 use turborepo_errors::TURBO_SITE;
-use turborepo_repository::package_json::{Error as PackageJsonError, PackageJson};
 
-pub use crate::turbo_json::RawTurboJson;
-use crate::{commands::CommandBase, turbo_json};
+pub use crate::turbo_json::{RawTurboJson, UIMode};
+use crate::{cli::EnvMode, commands::CommandBase, turbo_json};
 
 #[derive(Debug, Error, Diagnostic)]
 #[error("Environment variables should not be prefixed with \"{env_pipeline_delimiter}\"")]
@@ -103,6 +107,14 @@ pub enum Error {
         #[source_code]
         text: NamedSource,
     },
+    #[error("`{field}` cannot contain an environment variable")]
+    InvalidDependsOnValue {
+        field: &'static str,
+        #[label("environment variable found here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        text: NamedSource,
+    },
     #[error("`{field}` cannot contain an absolute path")]
     AbsolutePathInConfig {
         field: &'static str,
@@ -118,6 +130,21 @@ pub enum Error {
         #[source_code]
         text: NamedSource,
     },
+    #[error("Tasks cannot be marked as interactive and cacheable")]
+    InteractiveNoCacheable {
+        #[label("marked interactive here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        text: NamedSource,
+    },
+    #[error("found `pipeline` field instead of `tasks`")]
+    #[diagnostic(help("changed in 2.0: `pipeline` has been renamed to `tasks`"))]
+    PipelineField {
+        #[label("rename `pipeline` field to `tasks`")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        text: NamedSource,
+    },
     #[error("Failed to create APIClient: {0}")]
     ApiClient(#[source] turborepo_api_client::Error),
     #[error("{0} is not UTF8.")]
@@ -128,11 +155,21 @@ pub enum Error {
     InvalidRemoteCacheEnabled,
     #[error("TURBO_REMOTE_CACHE_TIMEOUT: error parsing timeout.")]
     InvalidRemoteCacheTimeout(#[source] std::num::ParseIntError),
+    #[error("TURBO_REMOTE_CACHE_UPLOAD_TIMEOUT: error parsing timeout.")]
+    InvalidUploadTimeout(#[source] std::num::ParseIntError),
     #[error("TURBO_PREFLIGHT should be either 1 or 0.")]
     InvalidPreflight,
     #[error(transparent)]
     #[diagnostic(transparent)]
     TurboJsonParseError(#[from] turbo_json::parser::Error),
+    #[error("found absolute path in `cacheDir`")]
+    #[diagnostic(help("if absolute paths are required, use `--cache-dir` or `TURBO_CACHE_DIR`"))]
+    AbsoluteCacheDir {
+        #[label("make `cacheDir` value a relative unix path")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        text: NamedSource,
+    },
 }
 
 macro_rules! create_builder {
@@ -147,6 +184,7 @@ macro_rules! create_builder {
 const DEFAULT_API_URL: &str = "https://vercel.com/api";
 const DEFAULT_LOGIN_URL: &str = "https://vercel.com";
 const DEFAULT_TIMEOUT: u64 = 30;
+const DEFAULT_UPLOAD_TIMEOUT: u64 = 60;
 
 // We intentionally don't derive Serialize so that different parts
 // of the code that want to display the config can tune how they
@@ -174,8 +212,20 @@ pub struct ConfigurationOptions {
     pub(crate) signature: Option<bool>,
     pub(crate) preflight: Option<bool>,
     pub(crate) timeout: Option<u64>,
+    pub(crate) upload_timeout: Option<u64>,
     pub(crate) enabled: Option<bool>,
     pub(crate) spaces_id: Option<String>,
+    #[serde(rename = "ui")]
+    pub(crate) ui: Option<UIMode>,
+    #[serde(rename = "dangerouslyDisablePackageManagerCheck")]
+    pub(crate) allow_no_package_manager: Option<bool>,
+    pub(crate) daemon: Option<bool>,
+    #[serde(rename = "envMode")]
+    pub(crate) env_mode: Option<EnvMode>,
+    pub(crate) scm_base: Option<String>,
+    pub(crate) scm_head: Option<String>,
+    #[serde(rename = "cacheDir")]
+    pub(crate) cache_dir: Option<Utf8PathBuf>,
 }
 
 #[derive(Default)]
@@ -225,12 +275,57 @@ impl ConfigurationOptions {
         self.preflight.unwrap_or_default()
     }
 
+    /// Note: 0 implies no timeout
     pub fn timeout(&self) -> u64 {
         self.timeout.unwrap_or(DEFAULT_TIMEOUT)
     }
 
+    /// Note: 0 implies no timeout
+    pub fn upload_timeout(&self) -> u64 {
+        self.upload_timeout.unwrap_or(DEFAULT_UPLOAD_TIMEOUT)
+    }
+
     pub fn spaces_id(&self) -> Option<&str> {
         self.spaces_id.as_deref()
+    }
+
+    pub fn ui(&self) -> UIMode {
+        // If we aren't hooked up to a TTY, then do not use TUI
+        if !atty::is(atty::Stream::Stdout) {
+            return UIMode::Stream;
+        }
+
+        self.ui.unwrap_or(UIMode::Stream)
+    }
+
+    pub fn scm_base(&self) -> Option<&str> {
+        non_empty_str(self.scm_base.as_deref())
+    }
+
+    pub fn scm_head(&self) -> &str {
+        non_empty_str(self.scm_head.as_deref()).unwrap_or("HEAD")
+    }
+
+    pub fn allow_no_package_manager(&self) -> bool {
+        self.allow_no_package_manager.unwrap_or_default()
+    }
+
+    pub fn daemon(&self) -> Option<bool> {
+        self.daemon
+    }
+
+    pub fn env_mode(&self) -> EnvMode {
+        self.env_mode.unwrap_or_default()
+    }
+
+    pub fn cache_dir(&self) -> &Utf8Path {
+        self.cache_dir.as_deref().unwrap_or_else(|| {
+            Utf8Path::new(if cfg!(windows) {
+                ".turbo\\cache"
+            } else {
+                ".turbo/cache"
+            })
+        })
     }
 }
 
@@ -239,23 +334,16 @@ fn non_empty_str(s: Option<&str>) -> Option<&str> {
     s.filter(|s| !s.is_empty())
 }
 
-trait ResolvedConfigurationOptions {
-    fn get_configuration_options(self) -> Result<ConfigurationOptions, Error>;
+fn truth_env_var(s: &str) -> Option<bool> {
+    match s {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
-impl ResolvedConfigurationOptions for PackageJson {
-    fn get_configuration_options(self) -> Result<ConfigurationOptions, Error> {
-        match &self.legacy_turbo_config {
-            Some(legacy_turbo_config) => {
-                let synthetic_raw_turbo_json: RawTurboJson = RawTurboJson::parse(
-                    &legacy_turbo_config.to_string(),
-                    AnchoredSystemPath::new("package.json").unwrap(),
-                )?;
-                synthetic_raw_turbo_json.get_configuration_options()
-            }
-            None => Ok(ConfigurationOptions::default()),
-        }
-    }
+trait ResolvedConfigurationOptions {
+    fn get_configuration_options(self) -> Result<ConfigurationOptions, Error>;
 }
 
 impl ResolvedConfigurationOptions for RawTurboJson {
@@ -265,12 +353,32 @@ impl ResolvedConfigurationOptions for RawTurboJson {
         } else {
             ConfigurationOptions::default()
         };
+
+        let cache_dir = if let Some(cache_dir) = self.cache_dir {
+            let cache_dir_str: &str = &cache_dir;
+            let cache_dir_unix = RelativeUnixPath::new(cache_dir_str).map_err(|_| {
+                let (span, text) = cache_dir.span_and_text("turbo.json");
+                Error::AbsoluteCacheDir { span, text }
+            })?;
+            // Convert the relative unix path to an anchored system path
+            // For unix/macos this is a no-op
+            let cache_dir_system = cache_dir_unix.to_anchored_system_path_buf();
+            Some(Utf8PathBuf::from(cache_dir_system.to_string()))
+        } else {
+            None
+        };
+
         // Don't allow token to be set for shared config.
         opts.token = None;
         opts.spaces_id = self
             .experimental_spaces
             .and_then(|spaces| spaces.id)
             .map(|spaces_id| spaces_id.into());
+        opts.ui = self.ui;
+        opts.allow_no_package_manager = self.allow_no_package_manager;
+        opts.daemon = self.daemon.map(|daemon| *daemon.as_inner());
+        opts.env_mode = self.env_mode;
+        opts.cache_dir = cache_dir;
         Ok(opts)
     }
 }
@@ -298,7 +406,21 @@ fn get_env_var_config(
     turbo_mapping.insert(OsString::from("turbo_teamid"), "team_id");
     turbo_mapping.insert(OsString::from("turbo_token"), "token");
     turbo_mapping.insert(OsString::from("turbo_remote_cache_timeout"), "timeout");
+    turbo_mapping.insert(
+        OsString::from("turbo_remote_cache_upload_timeout"),
+        "upload_timeout",
+    );
+    turbo_mapping.insert(OsString::from("turbo_ui"), "ui");
+    turbo_mapping.insert(
+        OsString::from("turbo_dangerously_disable_package_manager_check"),
+        "allow_no_package_manager",
+    );
+    turbo_mapping.insert(OsString::from("turbo_daemon"), "daemon");
+    turbo_mapping.insert(OsString::from("turbo_env_mode"), "env_mode");
+    turbo_mapping.insert(OsString::from("turbo_cache_dir"), "cache_dir");
     turbo_mapping.insert(OsString::from("turbo_preflight"), "preflight");
+    turbo_mapping.insert(OsString::from("turbo_scm_base"), "scm_base");
+    turbo_mapping.insert(OsString::from("turbo_scm_head"), "scm_head");
 
     // We do not enable new config sources:
     // turbo_mapping.insert(String::from("turbo_signature"), "signature"); // new
@@ -368,6 +490,46 @@ fn get_env_var_config(
         None
     };
 
+    let upload_timeout = if let Some(upload_timeout) = output_map.get("upload_timeout") {
+        Some(
+            upload_timeout
+                .parse::<u64>()
+                .map_err(Error::InvalidUploadTimeout)?,
+        )
+    } else {
+        None
+    };
+
+    // Process experimentalUI
+    let ui = output_map
+        .get("ui")
+        .map(|s| s.as_str())
+        .and_then(truth_env_var)
+        .map(|ui| if ui { UIMode::Tui } else { UIMode::Stream });
+
+    let allow_no_package_manager = output_map
+        .get("allow_no_package_manager")
+        .map(|s| s.as_str())
+        .and_then(truth_env_var);
+
+    // Process daemon
+    let daemon = output_map.get("daemon").and_then(|val| match val.as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    });
+
+    let env_mode = output_map
+        .get("env_mode")
+        .map(|s| s.as_str())
+        .and_then(|s| match s {
+            "strict" => Some(EnvMode::Strict),
+            "loose" => Some(EnvMode::Loose),
+            _ => None,
+        });
+
+    let cache_dir = output_map.get("cache_dir").map(|s| s.clone().into());
+
     // We currently don't pick up a Spaces ID via env var, we likely won't
     // continue using the Spaces name, we can add an env var when we have the
     // name we want to stick with.
@@ -379,15 +541,23 @@ fn get_env_var_config(
         team_slug: output_map.get("team_slug").cloned(),
         team_id: output_map.get("team_id").cloned(),
         token: output_map.get("token").cloned(),
+        scm_base: output_map.get("scm_base").cloned(),
+        scm_head: output_map.get("scm_head").cloned(),
 
         // Processed booleans
         signature,
         preflight,
         enabled,
+        ui,
+        allow_no_package_manager,
+        daemon,
 
         // Processed numbers
         timeout,
+        upload_timeout,
         spaces_id,
+        env_mode,
+        cache_dir,
     };
 
     Ok(output)
@@ -420,18 +590,38 @@ fn get_override_env_var_config(
         },
     )?;
 
+    let ui = environment
+        .get(OsStr::new("ci"))
+        .or_else(|| environment.get(OsStr::new("no_color")))
+        .and_then(|value| {
+            // If either of these are truthy, then we disable the TUI
+            if value == "true" || value == "1" {
+                Some(UIMode::Stream)
+            } else {
+                None
+            }
+        });
+
     let output = ConfigurationOptions {
         api_url: None,
         login_url: None,
         team_slug: None,
         team_id: output_map.get("team_id").cloned(),
         token: output_map.get("token").cloned(),
+        scm_base: None,
+        scm_head: None,
 
         signature: None,
         preflight: None,
         enabled: None,
+        ui,
+        daemon: None,
         timeout: None,
+        upload_timeout: None,
         spaces_id: None,
+        allow_no_package_manager: None,
+        env_mode: None,
+        cache_dir: None,
     };
 
     Ok(output)
@@ -566,10 +756,18 @@ impl TurborepoConfigBuilder {
     create_builder!(with_enabled, enabled, Option<bool>);
     create_builder!(with_preflight, preflight, Option<bool>);
     create_builder!(with_timeout, timeout, Option<u64>);
+    create_builder!(with_ui, ui, Option<UIMode>);
+    create_builder!(
+        with_allow_no_package_manager,
+        allow_no_package_manager,
+        Option<bool>
+    );
+    create_builder!(with_daemon, daemon, Option<bool>);
+    create_builder!(with_env_mode, env_mode, Option<EnvMode>);
+    create_builder!(with_cache_dir, cache_dir, Option<Utf8PathBuf>);
 
     pub fn build(&self) -> Result<ConfigurationOptions, Error> {
         // Priority, from least significant to most significant:
-        // - shared configuration (package.json .turbo)
         // - shared configuration (turbo.json)
         // - global configuration (~/.turbo/config.json)
         // - local configuration (<REPO_ROOT>/.turbo/config.json)
@@ -577,16 +775,6 @@ impl TurborepoConfigBuilder {
         // - CLI arguments
         // - builder pattern overrides.
 
-        let root_package_json = PackageJson::load(&self.repo_root.join_component("package.json"))
-            .or_else(|e| {
-            if let PackageJsonError::Io(e) = &e {
-                if matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                    return Ok(Default::default());
-                }
-            }
-
-            Err(e)
-        })?;
         let turbo_json = RawTurboJson::read(
             &self.repo_root,
             AnchoredSystemPath::new("turbo.json").unwrap(),
@@ -608,7 +796,6 @@ impl TurborepoConfigBuilder {
         let override_env_var_config = get_override_env_var_config(&env_vars)?;
 
         let sources = [
-            root_package_json.get_configuration_options(),
             turbo_json.get_configuration_options(),
             global_config.get_configuration_options(),
             global_auth.get_configuration_options(),
@@ -652,6 +839,29 @@ impl TurborepoConfigBuilder {
                     if let Some(spaces_id) = current_source_config.spaces_id {
                         acc.spaces_id = Some(spaces_id);
                     }
+                    if let Some(ui) = current_source_config.ui {
+                        acc.ui = Some(ui);
+                    }
+                    if let Some(allow_no_package_manager) =
+                        current_source_config.allow_no_package_manager
+                    {
+                        acc.allow_no_package_manager = Some(allow_no_package_manager);
+                    }
+                    if let Some(daemon) = current_source_config.daemon {
+                        acc.daemon = Some(daemon);
+                    }
+                    if let Some(env_mode) = current_source_config.env_mode {
+                        acc.env_mode = Some(env_mode);
+                    }
+                    if let Some(scm_base) = current_source_config.scm_base {
+                        acc.scm_base = Some(scm_base);
+                    }
+                    if let Some(scm_head) = current_source_config.scm_head {
+                        acc.scm_head = Some(scm_head);
+                    }
+                    if let Some(cache_dir) = current_source_config.cache_dir {
+                        acc.cache_dir = Some(cache_dir);
+                    }
 
                     acc
                 })
@@ -664,12 +874,17 @@ impl TurborepoConfigBuilder {
 mod test {
     use std::{collections::HashMap, ffi::OsString};
 
+    use camino::Utf8PathBuf;
     use tempfile::TempDir;
     use turbopath::AbsoluteSystemPathBuf;
 
-    use crate::config::{
-        get_env_var_config, get_override_env_var_config, ConfigurationOptions,
-        TurborepoConfigBuilder, DEFAULT_API_URL, DEFAULT_LOGIN_URL, DEFAULT_TIMEOUT,
+    use crate::{
+        cli::EnvMode,
+        config::{
+            get_env_var_config, get_override_env_var_config, ConfigurationOptions,
+            TurborepoConfigBuilder, DEFAULT_API_URL, DEFAULT_LOGIN_URL, DEFAULT_TIMEOUT,
+        },
+        turbo_json::UIMode,
     };
 
     #[test]
@@ -685,6 +900,7 @@ mod test {
         assert!(!defaults.preflight());
         assert_eq!(defaults.timeout(), DEFAULT_TIMEOUT);
         assert_eq!(defaults.spaces_id(), None);
+        assert!(!defaults.allow_no_package_manager());
     }
 
     #[test]
@@ -696,6 +912,7 @@ mod test {
         let turbo_team = "vercel";
         let turbo_teamid = "team_nLlpyC6REAqxydlFKbrMDlud";
         let turbo_token = "abcdef1234567890abcdef";
+        let cache_dir = Utf8PathBuf::from("nebulo9");
         let turbo_remote_cache_timeout = 200;
 
         env.insert("turbo_api".into(), turbo_api.into());
@@ -707,7 +924,15 @@ mod test {
             "turbo_remote_cache_timeout".into(),
             turbo_remote_cache_timeout.to_string().into(),
         );
+        env.insert("turbo_ui".into(), "true".into());
+        env.insert(
+            "turbo_dangerously_disable_package_manager_check".into(),
+            "true".into(),
+        );
+        env.insert("turbo_daemon".into(), "true".into());
         env.insert("turbo_preflight".into(), "true".into());
+        env.insert("turbo_env_mode".into(), "strict".into());
+        env.insert("turbo_cache_dir".into(), cache_dir.clone().into());
 
         let config = get_env_var_config(&env).unwrap();
         assert!(config.preflight());
@@ -717,6 +942,11 @@ mod test {
         assert_eq!(turbo_teamid, config.team_id.unwrap());
         assert_eq!(turbo_token, config.token.unwrap());
         assert_eq!(turbo_remote_cache_timeout, config.timeout.unwrap());
+        assert_eq!(Some(UIMode::Tui), config.ui);
+        assert_eq!(Some(true), config.allow_no_package_manager);
+        assert_eq!(Some(true), config.daemon);
+        assert_eq!(Some(EnvMode::Strict), config.env_mode);
+        assert_eq!(cache_dir, config.cache_dir.unwrap());
     }
 
     #[test]
@@ -727,7 +957,12 @@ mod test {
         env.insert("turbo_team".into(), "".into());
         env.insert("turbo_teamid".into(), "".into());
         env.insert("turbo_token".into(), "".into());
+        env.insert("turbo_ui".into(), "".into());
+        env.insert("turbo_daemon".into(), "".into());
+        env.insert("turbo_env_mode".into(), "".into());
         env.insert("turbo_preflight".into(), "".into());
+        env.insert("turbo_scm_head".into(), "".into());
+        env.insert("turbo_scm_base".into(), "".into());
 
         let config = get_env_var_config(&env).unwrap();
         assert_eq!(config.api_url(), DEFAULT_API_URL);
@@ -735,7 +970,12 @@ mod test {
         assert_eq!(config.team_slug(), None);
         assert_eq!(config.team_id(), None);
         assert_eq!(config.token(), None);
+        assert_eq!(config.ui, None);
+        assert_eq!(config.daemon, None);
+        assert_eq!(config.env_mode, None);
         assert!(!config.preflight());
+        assert_eq!(config.scm_base(), None);
+        assert_eq!(config.scm_head(), "HEAD");
     }
 
     #[test]
@@ -753,10 +993,12 @@ mod test {
             "vercel_artifacts_owner".into(),
             vercel_artifacts_owner.into(),
         );
+        env.insert("ci".into(), "1".into());
 
         let config = get_override_env_var_config(&env).unwrap();
         assert_eq!(vercel_artifacts_token, config.token.unwrap());
         assert_eq!(vercel_artifacts_owner, config.team_id.unwrap());
+        assert_eq!(Some(UIMode::Stream), config.ui);
     }
 
     #[test]
@@ -807,5 +1049,51 @@ mod test {
         assert_eq!(config.team_id().unwrap(), vercel_artifacts_owner);
         assert_eq!(config.token().unwrap(), vercel_artifacts_token);
         assert_eq!(config.spaces_id().unwrap(), "my-spaces-id");
+    }
+
+    #[test]
+    fn test_turbo_json_remote_cache() {
+        let tmp_dir = TempDir::new().unwrap();
+        let repo_root = AbsoluteSystemPathBuf::try_from(tmp_dir.path()).unwrap();
+
+        let api_url = "url1";
+        let login_url = "url2";
+        let team_slug = "my-slug";
+        let team_id = "an-id";
+        let turbo_json_contents = serde_json::to_string_pretty(&serde_json::json!({
+            "remoteCache": {
+                "enabled": true,
+                "apiUrl": api_url,
+                "loginUrl": login_url,
+                "teamSlug": team_slug,
+                "teamId": team_id,
+                "signature": true,
+                "preflight": false,
+                "timeout": 123
+            }
+        }))
+        .unwrap();
+        repo_root
+            .join_component("turbo.json")
+            .create_with_contents(&turbo_json_contents)
+            .unwrap();
+
+        let builder = TurborepoConfigBuilder {
+            repo_root,
+            override_config: ConfigurationOptions::default(),
+            global_config_path: None,
+            environment: HashMap::default(),
+        };
+
+        let config = builder.build().unwrap();
+        // Directly accessing field to make sure we're not getting the default value
+        assert_eq!(config.enabled, Some(true));
+        assert_eq!(config.api_url(), api_url);
+        assert_eq!(config.login_url(), login_url);
+        assert_eq!(config.team_slug(), Some(team_slug));
+        assert_eq!(config.team_id(), Some(team_id));
+        assert!(config.signature());
+        assert!(!config.preflight());
+        assert_eq!(config.timeout(), 123);
     }
 }

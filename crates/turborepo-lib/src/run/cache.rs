@@ -1,14 +1,19 @@
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use tokio::sync::oneshot;
 use tracing::{debug, error};
 use turbopath::{
     AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPath, AnchoredSystemPathBuf,
 };
-use turborepo_cache::{AsyncCache, CacheError, CacheHitMetadata, CacheSource};
+use turborepo_cache::{http::UploadMap, AsyncCache, CacheError, CacheHitMetadata, CacheSource};
 use turborepo_repository::package_graph::PackageInfo;
 use turborepo_scm::SCM;
 use turborepo_telemetry::events::{task::PackageTaskEventBuilder, TrackedErrors};
-use turborepo_ui::{color, replay_logs, ColorSelector, LogWriter, GREY, UI};
+use turborepo_ui::{color, tui::event::CacheResult, ColorConfig, ColorSelector, LogWriter, GREY};
 
 use crate::{
     cli::OutputLogsMode,
@@ -40,14 +45,21 @@ pub enum Error {
 }
 
 pub struct RunCache {
-    task_output_mode: Option<OutputLogsMode>,
+    task_output_logs: Option<OutputLogsMode>,
     cache: AsyncCache,
     reads_disabled: bool,
     writes_disabled: bool,
     repo_root: AbsoluteSystemPathBuf,
     color_selector: ColorSelector,
     daemon_client: Option<DaemonClient<DaemonConnector>>,
-    ui: UI,
+    ui: ColorConfig,
+}
+
+/// Trait used to output cache information to user
+pub trait CacheOutput {
+    fn status(&mut self, message: &str, result: CacheResult);
+    fn error(&mut self, message: &str);
+    fn replay_logs(&mut self, log_file: &AbsoluteSystemPath) -> Result<(), turborepo_ui::Error>;
 }
 
 impl RunCache {
@@ -57,16 +69,16 @@ impl RunCache {
         opts: &RunCacheOpts,
         color_selector: ColorSelector,
         daemon_client: Option<DaemonClient<DaemonConnector>>,
-        ui: UI,
+        ui: ColorConfig,
         is_dry_run: bool,
     ) -> Self {
-        let task_output_mode = if is_dry_run {
+        let task_output_logs = if is_dry_run {
             Some(OutputLogsMode::None)
         } else {
-            opts.task_output_mode_override
+            opts.task_output_logs_override
         };
         RunCache {
-            task_output_mode,
+            task_output_logs,
             cache,
             reads_disabled: opts.skip_reads,
             writes_disabled: opts.skip_writes,
@@ -92,9 +104,9 @@ impl RunCache {
         let repo_relative_globs =
             task_definition.repo_relative_hashable_outputs(&task_id, workspace_info.package_path());
 
-        let mut task_output_mode = task_definition.output_mode;
-        if let Some(task_output_mode_override) = self.task_output_mode {
-            task_output_mode = task_output_mode_override;
+        let mut task_output_logs = task_definition.output_logs;
+        if let Some(task_output_logs_override) = self.task_output_logs {
+            task_output_logs = task_output_logs_override;
         }
 
         let caching_disabled = !task_definition.cache;
@@ -105,7 +117,7 @@ impl RunCache {
             repo_relative_globs,
             hash: hash.to_owned(),
             task_id,
-            task_output_mode,
+            task_output_logs,
             caching_disabled,
             log_file_path,
             daemon_client: self.daemon_client.clone(),
@@ -113,9 +125,11 @@ impl RunCache {
         }
     }
 
-    pub async fn shutdown_cache(&self) {
+    pub async fn shutdown_cache(
+        &self,
+    ) -> Result<(Arc<Mutex<UploadMap>>, oneshot::Receiver<()>), CacheError> {
         // Ignore errors coming from cache already shutting down
-        self.cache.shutdown().await.ok();
+        self.cache.start_shutdown().await
     }
 }
 
@@ -124,32 +138,36 @@ pub struct TaskCache {
     run_cache: Arc<RunCache>,
     repo_relative_globs: TaskOutputs,
     hash: String,
-    task_output_mode: OutputLogsMode,
+    task_output_logs: OutputLogsMode,
     caching_disabled: bool,
     log_file_path: AbsoluteSystemPathBuf,
     daemon_client: Option<DaemonClient<DaemonConnector>>,
-    ui: UI,
+    ui: ColorConfig,
     task_id: TaskId<'static>,
 }
 
 impl TaskCache {
+    pub fn output_logs(&self) -> OutputLogsMode {
+        self.task_output_logs
+    }
+
     /// Will read log file and write to output a line at a time
-    pub fn replay_log_file(&self, output: impl Write) -> Result<(), Error> {
+    pub fn replay_log_file(&self, output: &mut impl CacheOutput) -> Result<(), Error> {
         if self.log_file_path.exists() {
-            replay_logs(output, &self.log_file_path)?;
+            output.replay_logs(&self.log_file_path)?;
         }
 
         Ok(())
     }
 
-    pub fn on_error(&self, mut terminal_output: impl Write) -> Result<(), Error> {
-        if self.task_output_mode == OutputLogsMode::ErrorsOnly {
-            fallible_write(
-                &mut terminal_output,
+    pub fn on_error(&self, terminal_output: &mut impl CacheOutput) -> Result<(), Error> {
+        if self.task_output_logs == OutputLogsMode::ErrorsOnly {
+            terminal_output.status(
                 &format!(
-                    "cache miss, executing {}\n",
+                    "cache miss, executing {}",
                     color!(self.ui, GREY, "{}", self.hash)
                 ),
+                CacheResult::Miss,
             );
             self.replay_log_file(terminal_output)?;
         }
@@ -168,7 +186,7 @@ impl TaskCache {
         log_writer.with_log_file(&self.log_file_path)?;
 
         if !matches!(
-            self.task_output_mode,
+            self.task_output_logs,
             OutputLogsMode::None | OutputLogsMode::HashOnly | OutputLogsMode::ErrorsOnly
         ) {
             log_writer.with_writer(writer);
@@ -183,20 +201,20 @@ impl TaskCache {
 
     pub async fn restore_outputs(
         &mut self,
-        mut terminal_output: impl Write,
+        terminal_output: &mut impl CacheOutput,
         telemetry: &PackageTaskEventBuilder,
     ) -> Result<Option<CacheHitMetadata>, Error> {
         if self.caching_disabled || self.run_cache.reads_disabled {
             if !matches!(
-                self.task_output_mode,
+                self.task_output_logs,
                 OutputLogsMode::None | OutputLogsMode::ErrorsOnly
             ) {
-                fallible_write(
-                    &mut terminal_output,
+                terminal_output.status(
                     &format!(
-                        "cache bypass, force executing {}\n",
+                        "cache bypass, force executing {}",
                         color!(self.ui, GREY, "{}", self.hash)
                     ),
+                    CacheResult::Miss,
                 );
             }
 
@@ -239,15 +257,15 @@ impl TaskCache {
 
             let Some((cache_hit_metadata, restored_files)) = cache_status else {
                 if !matches!(
-                    self.task_output_mode,
+                    self.task_output_logs,
                     OutputLogsMode::None | OutputLogsMode::ErrorsOnly
                 ) {
-                    fallible_write(
-                        &mut terminal_output,
+                    terminal_output.status(
                         &format!(
-                            "cache miss, executing {}\n",
+                            "cache miss, executing {}",
                             color!(self.ui, GREY, "{}", self.hash)
                         ),
+                        CacheResult::Miss,
                     );
                 }
 
@@ -291,28 +309,28 @@ impl TaskCache {
             " (outputs already on disk)"
         };
 
-        match self.task_output_mode {
+        match self.task_output_logs {
             OutputLogsMode::HashOnly | OutputLogsMode::NewOnly => {
-                fallible_write(
-                    &mut terminal_output,
+                terminal_output.status(
                     &format!(
-                        "cache hit{}, suppressing logs {}\n",
+                        "cache hit{}, suppressing logs {}",
                         more_context,
                         color!(self.ui, GREY, "{}", self.hash)
                     ),
+                    CacheResult::Hit,
                 );
             }
             OutputLogsMode::Full => {
                 debug!("log file path: {}", self.log_file_path);
-                fallible_write(
-                    &mut terminal_output,
+                terminal_output.status(
                     &format!(
-                        "cache hit{}, replaying logs {}\n",
+                        "cache hit{}, replaying logs {}",
                         more_context,
                         color!(self.ui, GREY, "{}", self.hash)
                     ),
+                    CacheResult::Hit,
                 );
-                self.replay_log_file(&mut terminal_output)?;
+                self.replay_log_file(terminal_output)?;
             }
             // Note that if we're restoring from cache, the task succeeded
             // so we know we don't need to print anything for errors

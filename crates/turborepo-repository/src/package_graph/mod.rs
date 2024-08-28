@@ -3,9 +3,13 @@ use std::{
     fmt,
 };
 
+use itertools::Itertools;
 use petgraph::visit::{depth_first_search, Reversed};
 use serde::Serialize;
-use turbopath::{AbsoluteSystemPath, AnchoredSystemPath, AnchoredSystemPathBuf};
+use tracing::debug;
+use turbopath::{
+    AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPath, AnchoredSystemPathBuf,
+};
 use turborepo_graph_utils as graph;
 use turborepo_lockfiles::Lockfile;
 
@@ -16,6 +20,7 @@ use crate::{
 
 pub mod builder;
 mod dep_splitter;
+mod npmrc;
 
 pub use builder::{Error, PackageGraphBuilder};
 
@@ -29,6 +34,7 @@ pub struct PackageGraph {
     packages: HashMap<PackageName, PackageInfo>,
     package_manager: PackageManager,
     lockfile: Option<Box<dyn Lockfile>>,
+    repo_root: AbsoluteSystemPathBuf,
 }
 
 /// The WorkspacePackage follows the Vercel glossary of terms where "Workspace"
@@ -127,7 +133,16 @@ impl PackageGraph {
 
     #[tracing::instrument(skip(self))]
     pub fn validate(&self) -> Result<(), Error> {
-        graph::validate_graph(&self.graph).map_err(Error::InvalidPackageGraph)
+        for info in self.packages.values() {
+            let name = info.package_json.name.as_deref();
+            if matches!(name, None | Some("")) {
+                let package_json_path = self.repo_root.resolve(info.package_json_path());
+                return Err(Error::PackageJsonMissingName(package_json_path));
+            }
+        }
+        graph::validate_graph(&self.graph).map_err(Error::InvalidPackageGraph)?;
+
+        Ok(())
     }
 
     pub fn remove_package_dependencies(&mut self) {
@@ -246,6 +261,9 @@ impl PackageGraph {
     pub fn dependencies<'a>(&'a self, node: &PackageNode) -> HashSet<&'a PackageNode> {
         let mut dependencies =
             self.transitive_closure_inner(Some(node), petgraph::Direction::Outgoing);
+        // Add in all root dependencies as they're implied dependencies for every
+        // package in the graph.
+        dependencies.extend(self.root_internal_dependencies());
         dependencies.remove(node);
         dependencies
     }
@@ -259,10 +277,93 @@ impl PackageGraph {
     ///
     /// ancestors(c) = {a, b}
     pub fn ancestors(&self, node: &PackageNode) -> HashSet<&PackageNode> {
-        let mut dependents =
-            self.transitive_closure_inner(Some(node), petgraph::Direction::Incoming);
+        // If node is a root dep, then *every* package is an ancestor of this one
+        let mut dependents = if self.root_internal_dependencies().contains(node) {
+            return self.graph.node_weights().collect();
+        } else {
+            self.transitive_closure_inner(Some(node), petgraph::Direction::Incoming)
+        };
         dependents.remove(node);
         dependents
+    }
+
+    pub fn root_internal_package_dependencies(&self) -> HashSet<WorkspacePackage> {
+        let dependencies = self.root_internal_dependencies();
+        dependencies
+            .into_iter()
+            .filter_map(|package| match package {
+                PackageNode::Workspace(package) => {
+                    let path = self
+                        .package_dir(package)
+                        .expect("packages in graph should have info");
+                    Some(WorkspacePackage {
+                        name: package.clone(),
+                        path: path.to_owned(),
+                    })
+                }
+                PackageNode::Root => None,
+            })
+            .collect()
+    }
+
+    pub fn root_internal_package_dependencies_paths(&self) -> Vec<&AnchoredSystemPath> {
+        let dependencies = self.root_internal_dependencies();
+        dependencies
+            .into_iter()
+            .filter_map(|package| match package {
+                PackageNode::Workspace(package) => Some(
+                    self.package_dir(package)
+                        .expect("packages in graph should have info"),
+                ),
+                PackageNode::Root => None,
+            })
+            .sorted()
+            .collect()
+    }
+
+    /// Provides a path from the root package to package
+    ///
+    /// Currently only provides the shortest path as calculating all paths can
+    /// be O(n!)
+    pub fn root_internal_dependency_explanation(
+        &self,
+        package: &WorkspacePackage,
+    ) -> Option<String> {
+        let from = *self
+            .node_lookup
+            .get(&PackageNode::Workspace(PackageName::Root))
+            .expect("all graphs should have a root");
+        let to = *self
+            .node_lookup
+            .get(&PackageNode::Workspace(package.name.clone()))?;
+        let (_cost, path) =
+            petgraph::algo::astar(&self.graph, from, |node| node == to, |_| 1, |_| 1)?;
+        Some(
+            self.path_display(&path)
+                .expect("path should only contain valid node indices"),
+        )
+    }
+
+    fn path_display(&self, path: &[petgraph::graph::NodeIndex]) -> Option<String> {
+        let mut package_names = Vec::with_capacity(path.len());
+        for index in path {
+            let node = self.graph.node_weight(*index)?;
+            let name = node.as_package_name().to_string();
+            package_names.push(name);
+        }
+
+        Some(package_names.join(" -> "))
+    }
+
+    fn root_internal_dependencies(&self) -> HashSet<&PackageNode> {
+        // We cannot call self.dependencies(&PackageNode::Workspace(PackageName::Root))
+        // as it will infinitely recurse.
+        let mut dependencies = self.transitive_closure_inner(
+            Some(&PackageNode::Workspace(PackageName::Root)),
+            petgraph::Direction::Outgoing,
+        );
+        dependencies.remove(&PackageNode::Workspace(PackageName::Root));
+        dependencies
     }
 
     /// Returns the transitive closure of the given nodes in the package
@@ -344,7 +445,12 @@ impl PackageGraph {
             })
             .collect::<HashMap<_, HashMap<_, _>>>();
 
-        let closures = turborepo_lockfiles::all_transitive_closures(previous, external_deps)?;
+        // We're comparing to a previous lockfile, it's possible that a package was
+        // added and thus won't exist in the previous lockfile. In that case,
+        // we're fine to ignore it. Assuming there is not a commit with a stale
+        // lockfile, the same commit should add the package, so it will get
+        // picked up as changed.
+        let closures = turborepo_lockfiles::all_transitive_closures(previous, external_deps, true)?;
 
         let global_change = current.global_change(previous);
 
@@ -353,9 +459,20 @@ impl PackageGraph {
         } else {
             self.packages
                 .iter()
-                .filter(|(_name, info)| {
-                    closures.get(info.package_path().to_unix().as_str())
-                        != info.transitive_dependencies.as_ref()
+                .filter(|(name, info)| {
+                    let previous_closure = closures.get(info.package_path().to_unix().as_str());
+                    let not_equal = previous_closure != info.transitive_dependencies.as_ref();
+                    if not_equal {
+                        if let (Some(prev), Some(curr)) =
+                            (previous_closure, info.transitive_dependencies.as_ref())
+                        {
+                            debug!(
+                                "package {name} has differing closure: {:?}",
+                                prev.symmetric_difference(curr)
+                            );
+                        }
+                    }
+                    not_equal
                 })
                 .map(|(name, info)| match name {
                     PackageName::Other(n) => {
@@ -448,7 +565,6 @@ mod test {
     use std::assert_matches::assert_matches;
 
     use serde_json::json;
-    use turbopath::AbsoluteSystemPathBuf;
 
     use super::*;
     use crate::discovery::PackageDiscovery;
@@ -475,17 +591,24 @@ mod test {
     async fn test_single_package_is_depends_on_root() {
         let root =
             AbsoluteSystemPathBuf::new(if cfg!(windows) { r"C:\repo" } else { "/repo" }).unwrap();
-        let pkg_graph = PackageGraph::builder(&root, PackageJson::default())
-            .with_package_discovery(MockDiscovery)
-            .with_single_package_mode(true)
-            .build()
-            .await
-            .unwrap();
+        let pkg_graph = PackageGraph::builder(
+            &root,
+            PackageJson {
+                name: Some("my-package".to_owned()),
+                ..Default::default()
+            },
+        )
+        .with_package_discovery(MockDiscovery)
+        .with_single_package_mode(true)
+        .build()
+        .await
+        .unwrap();
 
         let closure =
             pkg_graph.transitive_closure(Some(&PackageNode::Workspace(PackageName::Root)));
         assert!(closure.contains(&PackageNode::Root));
-        assert!(pkg_graph.validate().is_ok());
+        let result = pkg_graph.validate();
+        assert!(result.is_ok(), "expected ok {:?}", result);
     }
 
     #[tokio::test]
@@ -494,7 +617,10 @@ mod test {
             AbsoluteSystemPathBuf::new(if cfg!(windows) { r"C:\repo" } else { "/repo" }).unwrap();
         let pkg_graph = PackageGraph::builder(
             &root,
-            PackageJson::from_value(json!({ "name": "root" })).unwrap(),
+            PackageJson::from_value(
+                json!({ "name": "root", "dependencies": { "a": "workspace:*"} }),
+            )
+            .unwrap(),
         )
         .with_package_discovery(MockDiscovery)
         .with_package_jsons(Some({
@@ -547,6 +673,19 @@ mod test {
 
         let pkg_version = b_external.get("c").unwrap();
         assert_eq!(pkg_version, "1.2.3");
+        let closure =
+            pkg_graph.transitive_closure(Some(&PackageNode::Workspace(PackageName::Root)));
+        assert_eq!(
+            closure,
+            [
+                PackageNode::Root,
+                PackageNode::Workspace(PackageName::Root),
+                PackageNode::Workspace("a".into()),
+                PackageNode::Workspace("b".into()),
+            ]
+            .iter()
+            .collect::<HashSet<_>>()
+        );
     }
 
     #[derive(Debug)]
@@ -604,6 +743,10 @@ mod test {
 
         fn global_change(&self, _other: &dyn Lockfile) -> bool {
             unreachable!("global change detection not necessary for package graph construction")
+        }
+
+        fn turbo_version(&self) -> Option<String> {
+            None
         }
     }
 

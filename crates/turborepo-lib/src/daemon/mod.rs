@@ -100,7 +100,7 @@ pub(crate) mod proto {
     /// - Bump the minor version if adding new features, such that clients can
     ///   mandate at least some set of features on the target server.
     /// - Bump the patch version if making backwards compatible bug fixes.
-    pub const VERSION: &str = "1.11.0";
+    pub const VERSION: &str = "2.0.0";
 
     impl From<PackageManager> for turborepo_repository::package_manager::PackageManager {
         fn from(pm: PackageManager) -> Self {
@@ -110,6 +110,7 @@ pub(crate) mod proto {
                 PackageManager::Berry => Self::Berry,
                 PackageManager::Pnpm => Self::Pnpm,
                 PackageManager::Pnpm6 => Self::Pnpm6,
+                PackageManager::Pnpm9 => Self::Pnpm9,
                 PackageManager::Bun => Self::Bun,
             }
         }
@@ -123,6 +124,7 @@ pub(crate) mod proto {
                 turborepo_repository::package_manager::PackageManager::Berry => Self::Berry,
                 turborepo_repository::package_manager::PackageManager::Pnpm => Self::Pnpm,
                 turborepo_repository::package_manager::PackageManager::Pnpm6 => Self::Pnpm6,
+                turborepo_repository::package_manager::PackageManager::Pnpm9 => Self::Pnpm9,
                 turborepo_repository::package_manager::PackageManager::Bun => Self::Bun,
             }
         }

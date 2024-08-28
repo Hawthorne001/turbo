@@ -193,11 +193,6 @@ impl CookieWriter {
         Self::new(&cookie_root, timeout, recv)
     }
 
-    #[cfg(test)]
-    pub(crate) fn cookie_dir(&self) -> &AbsoluteSystemPath {
-        &self.cookie_root
-    }
-
     pub fn new(
         cookie_root: &AbsoluteSystemPath,
         timeout: Duration,
@@ -495,6 +490,10 @@ impl<T, U: CookieReady + Clone> CookiedOptionalWatch<T, U> {
     async fn get_inner(&mut self) -> Result<SomeRef<'_, T>, watch::error::RecvError> {
         self.value.wait_for(|f| f.is_some()).await?;
         Ok(SomeRef(self.value.borrow()))
+    }
+
+    pub(crate) fn watch(&self) -> watch::Receiver<Option<T>> {
+        self.value.clone()
     }
 }
 

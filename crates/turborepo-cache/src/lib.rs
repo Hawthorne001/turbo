@@ -19,6 +19,7 @@ mod multiplexer;
 pub mod signature_authentication;
 #[cfg(test)]
 mod test_cases;
+mod upload_progress;
 
 use std::{backtrace, backtrace::Backtrace};
 
@@ -44,6 +45,10 @@ pub enum CacheError {
     InvalidFilePath(String, #[backtrace] Backtrace),
     #[error("failed to contact remote cache: {0}")]
     ApiClientError(Box<turborepo_api_client::Error>, #[backtrace] Backtrace),
+    #[error("the cache artifact for {0} was too large to upload within the timeout")]
+    TimeoutError(String),
+    #[error("could not connect to the cache")]
+    ConnectError,
     #[error("signing artifact failed: {0}")]
     SignatureError(#[from] SignatureError, #[backtrace] Backtrace),
     #[error("invalid duration")]
@@ -98,9 +103,9 @@ pub struct CacheHitMetadata {
     pub time_saved: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CacheOpts {
-    pub override_dir: Option<Utf8PathBuf>,
+    pub cache_dir: Utf8PathBuf,
     pub remote_cache_read_only: bool,
     pub skip_remote: bool,
     pub skip_filesystem: bool,

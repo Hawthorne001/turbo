@@ -1,370 +1,127 @@
-use std::time::Instant;
-
 use ratatui::{
-    buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::Line,
-    widgets::{
-        Block, BorderType, Borders, Cell, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
-    },
+    layout::{Constraint, Rect},
+    style::{Color, Style, Stylize},
+    text::Text,
+    widgets::{Cell, Row, StatefulWidget, Table, TableState},
 };
 
-use super::{
-    task::{Finished, Planned, Running, Task},
-    task_duration::TaskDuration,
-    Error,
-};
-
-const FOOTER_TEXT: &str = "Use arrow keys to navigate";
+use super::{event::TaskResult, spinner::SpinnerState, task::TasksByStatus};
 
 /// A widget that renders a table of their tasks and their current status
 ///
 /// The table contains finished tasks, running tasks, and planned tasks rendered
 /// in that order.
-pub struct TaskTable {
-    // Start of the run and the current time
-    start: Instant,
-    current: Instant,
-    // Tasks to be displayed
-    // Ordered by when they finished
-    finished: Vec<Task<Finished>>,
-    // Ordered by when they started
-    running: Vec<Task<Running>>,
-    // Ordered by task name
-    planned: Vec<Task<Planned>>,
-    // State used for showing things
-    task_column_width: u16,
-    scroll: TableState,
+pub struct TaskTable<'b> {
+    tasks_by_type: &'b TasksByStatus,
+    spinner: SpinnerState,
 }
 
-impl TaskTable {
+const TASK_NAVIGATE_INSTRUCTIONS: &str = "↑ ↓ to navigate";
+
+impl<'b> TaskTable<'b> {
     /// Construct a new table with all of the planned tasks
-    pub fn new(tasks: impl IntoIterator<Item = String>) -> Self {
-        let mut planned = tasks.into_iter().map(Task::new).collect::<Vec<_>>();
-        planned.sort_unstable();
-        planned.dedup();
-        let task_column_width = planned
-            .iter()
-            .map(|task| task.name().len())
+    pub fn new(tasks_by_type: &'b TasksByStatus) -> Self {
+        Self {
+            tasks_by_type,
+            spinner: SpinnerState::default(),
+        }
+    }
+
+    /// Provides a suggested width for the task table
+    pub fn width_hint<'a>(tasks: impl Iterator<Item = &'a str>) -> u16 {
+        let task_name_width = tasks
+            .map(|task| task.len())
             .max()
             .unwrap_or_default()
-            // Task column width should be large enough to fit "Task" title
-            .max(4) as u16;
-        Self {
-            start: Instant::now(),
-            current: Instant::now(),
-            planned,
-            running: Vec::new(),
-            finished: Vec::new(),
-            task_column_width,
-            scroll: TableState::default(),
-        }
-    }
-
-    /// Number of rows in the table
-    pub fn len(&self) -> usize {
-        self.finished.len() + self.running.len() + self.planned.len()
-    }
-
-    /// If there are no tasks in the table
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Mark the given planned task as started
-    /// Errors if given task wasn't a planned task
-    pub fn start_task(&mut self, task: &str) -> Result<(), Error> {
-        let planned_idx = self
-            .planned
-            .binary_search_by(|planned_task| planned_task.name().cmp(task))
-            .map_err(|_| Error::TaskNotFound { name: task.into() })?;
-        let planned = self.planned.remove(planned_idx);
-        let old_row_idx = self.finished.len() + self.running.len() + planned_idx;
-        let new_row_idx = self.finished.len() + self.running.len();
-        let running = planned.start();
-        self.running.push(running);
-
-        if let Some(selected_idx) = self.scroll.selected() {
-            // If task that was just started is selected, then update selection to follow
-            // task
-            if selected_idx == old_row_idx {
-                self.scroll.select(Some(new_row_idx));
-            } else if new_row_idx <= selected_idx && selected_idx < old_row_idx {
-                // If the selected task is between the old and new row positions
-                // then increment the selection index to keep selection the same.
-                self.scroll.select(Some(selected_idx + 1));
-            }
-        }
-        self.tick();
-        Ok(())
-    }
-
-    /// Mark the given running task as finished
-    /// Errors if given task wasn't a running task
-    pub fn finish_task(&mut self, task: &str) -> Result<(), Error> {
-        let running_idx = self
-            .running
-            .iter()
-            .position(|running| running.name() == task)
-            .ok_or_else(|| Error::TaskNotFound { name: task.into() })?;
-        let old_row_idx = self.finished.len() + running_idx;
-        let new_row_idx = self.finished.len();
-        let running = self.running.remove(running_idx);
-        self.finished.push(running.finish());
-
-        if let Some(selected_row) = self.scroll.selected() {
-            // If task that was just started is selected, then update selection to follow
-            // task
-            if selected_row == old_row_idx {
-                self.scroll.select(Some(new_row_idx));
-            } else if new_row_idx <= selected_row && selected_row < old_row_idx {
-                // If the selected task is between the old and new row positions then increment
-                // the selection index to keep selection the same.
-                self.scroll.select(Some(selected_row + 1));
-            }
-        }
-
-        self.tick();
-        Ok(())
+            // Task column width should be large enough to fit "↑ ↓ to navigate instructions
+            // and truncate tasks with more than 40 chars.
+            .clamp(TASK_NAVIGATE_INSTRUCTIONS.len(), 40) as u16;
+        // Add space for column divider and status emoji
+        task_name_width + 1
     }
 
     /// Update the current time of the table
     pub fn tick(&mut self) {
-        self.current = Instant::now();
+        self.spinner.update();
     }
 
-    /// Select the next row
-    pub fn next(&mut self) {
-        let num_rows = self.len();
-        let i = match self.scroll.selected() {
-            Some(i) => (i + 1).clamp(0, num_rows - 1),
-            None => 0,
-        };
-        self.scroll.select(Some(i));
-    }
+    fn finished_rows(&self) -> impl Iterator<Item = Row> + '_ {
+        self.tasks_by_type.finished.iter().map(move |task| {
+            let name = if matches!(task.result(), TaskResult::CacheHit) {
+                Cell::new(Text::styled(task.name(), Style::default().italic()))
+            } else {
+                Cell::new(task.name())
+            };
 
-    /// Select the previous row
-    pub fn previous(&mut self) {
-        let i = match self.scroll.selected() {
-            Some(0) => 0,
-            Some(i) => i - 1,
-            None => 0,
-        };
-        self.scroll.select(Some(i));
-    }
-
-    pub fn selected(&self) -> Option<&str> {
-        let i = self.scroll.selected()?;
-        if i < self.finished.len() {
-            let task = self.finished.get(i)?;
-            Some(task.name())
-        } else if i < self.finished.len() + self.running.len() {
-            let task = self.running.get(i - self.finished.len())?;
-            Some(task.name())
-        } else if i < self.finished.len() + self.running.len() + self.planned.len() {
-            let task = self
-                .planned
-                .get(i - (self.finished.len() + self.running.len()))?;
-            Some(task.name())
-        } else {
-            None
-        }
-    }
-
-    fn finished_rows(&self, duration_width: u16) -> impl Iterator<Item = Row> + '_ {
-        self.finished.iter().map(move |task| {
             Row::new(vec![
-                Cell::new(task.name()),
-                Cell::new(TaskDuration::new(
-                    duration_width,
-                    self.start,
-                    self.current,
-                    task.start(),
-                    Some(task.end()),
-                )),
+                name,
+                match task.result() {
+                    // matches Next.js (and many other CLI tools) https://github.com/vercel/next.js/blob/1a04d94aaec943d3cce93487fea3b8c8f8898f31/packages/next/src/build/output/log.ts
+                    TaskResult::Success => {
+                        Cell::new(Text::styled("✓", Style::default().green().bold()))
+                    }
+                    TaskResult::CacheHit => {
+                        Cell::new(Text::styled("⊙", Style::default().magenta()))
+                    }
+                    TaskResult::Failure => {
+                        Cell::new(Text::styled("⨯", Style::default().red().bold()))
+                    }
+                },
             ])
         })
     }
 
-    fn running_rows(&self, duration_width: u16) -> impl Iterator<Item = Row> + '_ {
-        self.running.iter().map(move |task| {
-            Row::new(vec![
-                Cell::new(task.name()),
-                Cell::new(TaskDuration::new(
-                    duration_width,
-                    self.start,
-                    self.current,
-                    task.start(),
-                    None,
-                )),
-            ])
-        })
+    fn running_rows(&self) -> impl Iterator<Item = Row> + '_ {
+        let spinner = self.spinner.current();
+        self.tasks_by_type
+            .running
+            .iter()
+            .map(move |task| Row::new(vec![Cell::new(task.name()), Cell::new(Text::raw(spinner))]))
     }
 
-    fn planned_rows(&self, duration_width: u16) -> impl Iterator<Item = Row> + '_ {
-        self.planned.iter().map(move |task| {
-            Row::new(vec![
-                Cell::new(task.name()),
-                Cell::new(" ".repeat(duration_width as usize)),
-            ])
-        })
-    }
-
-    /// Convenience method which renders and updates scroll state
-    pub fn stateful_render(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let mut scroll = self.scroll.clone();
-        frame.render_stateful_widget(&*self, area, &mut scroll);
-        self.scroll = scroll;
-    }
-
-    fn column_widths(&self, parent_width: u16) -> (u16, u16) {
-        // We trim names to be 40 long (+1 for column divider)
-        let name_col_width = 40.min(self.task_column_width) + 1;
-        if name_col_width + 2 < parent_width {
-            let status_width = parent_width - (name_col_width + 2);
-            (name_col_width, status_width)
-        } else {
-            // If there isn't any space for the task status, just don't display anything
-            (name_col_width, 0)
-        }
-    }
-
-    fn render_footer(area: Rect, buf: &mut Buffer) {
-        let footer = Paragraph::new(Line::from(FOOTER_TEXT)).centered().block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_type(BorderType::Plain),
-        );
-        footer.render(area, buf);
+    fn planned_rows(&self) -> impl Iterator<Item = Row> + '_ {
+        self.tasks_by_type
+            .planned
+            .iter()
+            .map(move |task| Row::new(vec![Cell::new(task.name()), Cell::new(" ")]))
     }
 }
 
-impl<'a> StatefulWidget for &'a TaskTable {
+impl<'a> StatefulWidget for &'a TaskTable<'a> {
     type State = TableState;
 
     fn render(self, area: Rect, buf: &mut ratatui::prelude::Buffer, state: &mut Self::State) {
         let width = area.width;
-        let (name_width, status_width) = self.column_widths(width);
-        let areas = Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
-            .constraints([Constraint::Min(2), Constraint::Length(2)])
-            .split(area);
+        let bar = "─".repeat(usize::from(width));
         let table = Table::new(
-            self.finished_rows(status_width)
-                .chain(self.running_rows(status_width))
-                .chain(self.planned_rows(status_width)),
+            self.running_rows()
+                .chain(self.planned_rows())
+                .chain(self.finished_rows()),
             [
-                Constraint::Min(name_width),
-                Constraint::Length(status_width),
+                Constraint::Min(15),
+                // Status takes one cell to render
+                Constraint::Length(1),
             ],
         )
         .highlight_style(Style::default().fg(Color::Yellow))
+        .column_spacing(0)
         .header(
-            ["Task\n----", "Status\n------"]
-                .iter()
-                .copied()
+            vec![format!("Tasks\n{bar}"), " \n─".to_owned()]
+                .into_iter()
                 .map(Cell::from)
                 .collect::<Row>()
                 .height(2),
-        );
-        StatefulWidget::render(table, areas[0], buf, state);
-        TaskTable::render_footer(areas[1], buf);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    // Used by assert_buffer_eq
-    #[allow(unused_imports)]
-    use indoc::indoc;
-    use ratatui::assert_buffer_eq;
-
-    use super::*;
-
-    #[test]
-    fn test_scroll() {
-        let mut table = TaskTable::new(vec![
-            "foo".to_string(),
-            "bar".to_string(),
-            "baz".to_string(),
-        ]);
-        assert_eq!(table.scroll.selected(), None, "starts with no selection");
-        table.next();
-        assert_eq!(table.scroll.selected(), Some(0), "scroll starts from 0");
-        table.previous();
-        assert_eq!(table.scroll.selected(), Some(0), "scroll stays in bounds");
-        table.next();
-        table.next();
-        assert_eq!(table.scroll.selected(), Some(2), "scroll moves forwards");
-        table.next();
-        assert_eq!(table.scroll.selected(), Some(2), "scroll stays in bounds");
-    }
-
-    #[test]
-    fn test_selection_follows() {
-        let mut table = TaskTable::new(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        table.next();
-        table.next();
-        assert_eq!(table.scroll.selected(), Some(1), "selected b");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-        table.start_task("b").unwrap();
-        assert_eq!(table.scroll.selected(), Some(0), "b stays selected");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-        table.start_task("a").unwrap();
-        assert_eq!(table.scroll.selected(), Some(0), "b stays selected");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-        table.finish_task("a").unwrap();
-        assert_eq!(table.scroll.selected(), Some(1), "b stays selected");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-    }
-
-    #[test]
-    fn test_selection_stable() {
-        let mut table = TaskTable::new(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        table.next();
-        table.next();
-        assert_eq!(table.scroll.selected(), Some(1), "selected b");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-        // start c which moves it to "running" which is before "planned"
-        table.start_task("c").unwrap();
-        assert_eq!(table.scroll.selected(), Some(2), "selection stays on b");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-        table.start_task("a").unwrap();
-        assert_eq!(table.scroll.selected(), Some(2), "selection stays on b");
-        assert_eq!(table.selected(), Some("b"), "selected b");
-        // c
-        // a
-        // b <-
-        table.previous();
-        table.previous();
-        assert_eq!(table.scroll.selected(), Some(0), "selected c");
-        assert_eq!(table.selected(), Some("c"), "selected c");
-        table.finish_task("a").unwrap();
-        assert_eq!(table.scroll.selected(), Some(1), "c stays selected");
-        assert_eq!(table.selected(), Some("c"), "selected c");
-        table.previous();
-        table.finish_task("c").unwrap();
-        assert_eq!(table.scroll.selected(), Some(0), "a stays selected");
-        assert_eq!(table.selected(), Some("a"), "selected a");
-    }
-
-    #[test]
-    fn test_footer_always_rendered() {
-        let table = TaskTable::new(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        let area = Rect::new(0, 0, 14, 5);
-        let mut buffer = Buffer::empty(area);
-        let mut scroll = table.scroll.clone();
-        StatefulWidget::render(&table, area, &mut buffer, &mut scroll);
-        assert_buffer_eq!(
-            buffer,
-            Buffer::with_lines(vec![
-                "Task   Status ",
-                "----   ------ ",
-                "a             ",
-                "──────────────",
-                "Use arrow keys",
-            ])
         )
+        .footer(
+            vec![
+                format!("{bar}\n{TASK_NAVIGATE_INSTRUCTIONS}"),
+                format!("─\n "),
+            ]
+            .into_iter()
+            .map(Cell::from)
+            .collect::<Row>()
+            .height(2),
+        );
+        StatefulWidget::render(table, area, buf, state);
     }
 }

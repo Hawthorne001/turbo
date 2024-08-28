@@ -63,6 +63,8 @@ pub enum Error {
     Globwalk(#[from] globwalk::GlobError),
     #[error(transparent)]
     Walk(#[from] globwalk::WalkError),
+    #[error("unable to resolve base branch, please set with TURBO_SCM_BASE")]
+    UnableToResolveRef,
 }
 
 impl From<wax::BuildError> for Error {
@@ -143,7 +145,7 @@ pub(crate) fn wait_for_success<R: Read, T>(
     Err(Error::Git(err_text, Backtrace::capture()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Git {
     root: AbsoluteSystemPathBuf,
     bin: AbsoluteSystemPathBuf,
@@ -207,7 +209,7 @@ fn find_git_root(turbo_root: &AbsoluteSystemPath) -> Result<AbsoluteSystemPathBu
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SCM {
     Git(Git),
     Manual,

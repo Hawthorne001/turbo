@@ -20,7 +20,7 @@ use thiserror::Error;
 use turborepo_api_client::{CacheClient, Client};
 #[cfg(not(test))]
 use turborepo_ui::CYAN;
-use turborepo_ui::{DialoguerTheme, BOLD, GREY, UNDERLINE};
+use turborepo_ui::{DialoguerTheme, BOLD, GREY};
 use turborepo_vercel_api::{CachingStatus, Space, Team};
 
 use crate::{
@@ -89,11 +89,9 @@ pub(crate) enum SelectedSpace<'a> {
     Space(&'a Space),
 }
 
-pub(crate) const REMOTE_CACHING_INFO: &str = "  Remote Caching shares your cached Turborepo task \
-                                              outputs and logs across
-  all your team’s Vercel projects. It also can share outputs
-  with other services that enable Remote Caching, like CI/CD systems.
-  This results in faster build times and deployments for your team.";
+pub(crate) const REMOTE_CACHING_INFO: &str =
+    "Remote Caching makes your caching multiplayer,\nsharing build outputs and logs between \
+     developers and CI/CD systems.\n\nBuild and deploy faster.";
 pub(crate) const REMOTE_CACHING_URL: &str =
     "https://turbo.build/repo/docs/core-concepts/remote-caching";
 pub(crate) const SPACES_URL: &str = "https://vercel.com/docs/workflow-collaboration/vercel-spaces";
@@ -173,19 +171,16 @@ pub async fn link(
     let repo_root_with_tilde = base.repo_root.to_string().replacen(&*homedir, "~", 1);
     let api_client = base.api_client()?;
     let token = base.config()?.token().ok_or_else(|| Error::TokenNotFound {
-        command: base.ui.apply(BOLD.apply_to("`npx turbo login`")),
+        command: base.color_config.apply(BOLD.apply_to("`npx turbo login`")),
     })?;
 
     match target {
         LinkTarget::RemoteCache => {
             println!(
-                ">>> Remote Caching
-
-    {}
-      For more info, see {}
-      ",
+                "\n{}\n\n{}\n\nFor more information, visit: {}\n",
+                base.color_config.rainbow(">>> Remote Caching"),
                 REMOTE_CACHING_INFO,
-                base.ui.apply(UNDERLINE.apply_to(REMOTE_CACHING_URL))
+                REMOTE_CACHING_URL
             );
 
             if !should_link_remote_cache(base, &repo_root_with_tilde)? {
@@ -208,7 +203,7 @@ pub async fn link(
                 .await
                 .map_err(Error::TeamsRequest)?;
 
-            let selected_team = select_team(base, &teams_response.teams, user_display_name)?;
+            let selected_team = select_team(base, &teams_response.teams)?;
 
             let team_id = match selected_team {
                 SelectedTeam::User => user_response.user.id.as_str(),
@@ -269,8 +264,8 @@ pub async fn link(
 
     {}
         ",
-                base.ui.rainbow(">>> Success!"),
-                base.ui.apply(BOLD.apply_to(chosen_team_name)),
+                base.color_config.rainbow(">>> Success!"),
+                base.color_config.apply(BOLD.apply_to(chosen_team_name)),
                 GREY.apply_to("To disable Remote Caching, run `npx turbo unlink`")
             );
             Ok(())
@@ -281,7 +276,7 @@ pub async fn link(
 
       For more info, see {}
       ",
-                base.ui.apply(UNDERLINE.apply_to(SPACES_URL))
+                SPACES_URL
             );
 
             if !should_link_spaces(base, &repo_root_with_tilde)? {
@@ -293,18 +288,12 @@ pub async fn link(
                 .await
                 .map_err(Error::UserNotFound)?;
 
-            let user_display_name = user_response
-                .user
-                .name
-                .as_deref()
-                .unwrap_or(user_response.user.username.as_str());
-
             let teams_response = api_client
                 .get_teams(token)
                 .await
                 .map_err(Error::TeamsRequest)?;
 
-            let selected_team = select_team(base, &teams_response.teams, user_display_name)?;
+            let selected_team = select_team(base, &teams_response.teams)?;
 
             let team_id = match selected_team {
                 SelectedTeam::User => user_response.user.id.as_str(),
@@ -360,9 +349,10 @@ pub async fn link(
 
     {}
         ",
-                base.ui.rainbow(">>> Success!"),
-                base.ui.apply(BOLD.apply_to(&repo_root_with_tilde)),
-                base.ui.apply(BOLD.apply_to(&space.name)),
+                base.color_config.rainbow(">>> Success!"),
+                base.color_config
+                    .apply(BOLD.apply_to(&repo_root_with_tilde)),
+                base.color_config.apply(BOLD.apply_to(&space.name)),
                 GREY.apply_to(
                     "To remove Spaces integration, run `npx turbo unlink --target spaces`"
                 )
@@ -387,28 +377,18 @@ fn should_enable_caching() -> Result<bool, Error> {
 }
 
 #[cfg(test)]
-fn select_team<'a>(
-    _: &CommandBase,
-    teams: &'a [Team],
-    _: &'a str,
-) -> Result<SelectedTeam<'a>, Error> {
+fn select_team<'a>(_: &CommandBase, teams: &'a [Team]) -> Result<SelectedTeam<'a>, Error> {
     let mut rng = rand::thread_rng();
-    let idx = rng.gen_range(0..=(teams.len()));
-    if idx == teams.len() {
-        Ok(SelectedTeam::User)
-    } else {
-        Ok(SelectedTeam::Team(&teams[idx]))
-    }
+    let idx = rng.gen_range(0..(teams.len()));
+    Ok(SelectedTeam::Team(&teams[idx]))
 }
 
 #[cfg(not(test))]
-fn select_team<'a>(
-    base: &CommandBase,
-    teams: &'a [Team],
-    user_display_name: &'a str,
-) -> Result<SelectedTeam<'a>, Error> {
-    let mut team_names = vec![user_display_name];
-    team_names.extend(teams.iter().map(|team| team.name.as_str()));
+fn select_team<'a>(base: &CommandBase, teams: &'a [Team]) -> Result<SelectedTeam<'a>, Error> {
+    let team_names = teams
+        .iter()
+        .map(|team| team.name.as_str())
+        .collect::<Vec<_>>();
 
     let theme = DialoguerTheme {
         active_item_style: Style::new().cyan().bold(),
@@ -420,10 +400,10 @@ fn select_team<'a>(
 
     let prompt = format!(
         "{}\n  {}",
-        base.ui.apply(BOLD.apply_to(
+        base.color_config.apply(BOLD.apply_to(
             "Which Vercel scope (and Remote Cache) do you want associated with this Turborepo?",
         )),
-        base.ui
+        base.color_config
             .apply(CYAN.apply_to("[Use arrows to move, type to filter]"))
     );
 
@@ -434,11 +414,7 @@ fn select_team<'a>(
         .interact()
         .map_err(Error::UserCanceled)?;
 
-    if selection == 0 {
-        Ok(SelectedTeam::User)
-    } else {
-        Ok(SelectedTeam::Team(&teams[selection - 1]))
-    }
+    Ok(SelectedTeam::Team(&teams[selection]))
 }
 
 #[cfg(test)]
@@ -465,10 +441,10 @@ fn select_space<'a>(base: &CommandBase, spaces: &'a [Space]) -> Result<SelectedS
 
     let prompt = format!(
         "{}\n  {}",
-        base.ui.apply(
+        base.color_config.apply(
             BOLD.apply_to("Which Vercel space do you want associated with this Turborepo?",)
         ),
-        base.ui
+        base.color_config
             .apply(CYAN.apply_to("[Use arrows to move, type to filter]"))
     );
 
@@ -490,11 +466,13 @@ fn should_link_remote_cache(_: &CommandBase, _: &str) -> Result<bool, Error> {
 #[cfg(not(test))]
 fn should_link_remote_cache(base: &CommandBase, location: &str) -> Result<bool, Error> {
     let prompt = format!(
-        "{}{} {}",
-        base.ui.apply(BOLD.apply_to(GREY.apply_to("? "))),
-        base.ui
-            .apply(BOLD.apply_to("Would you like to enable Remote Caching for")),
-        base.ui.apply(BOLD.apply_to(CYAN.apply_to(location)))
+        "{}{} {}{}",
+        base.color_config.apply(BOLD.apply_to(GREY.apply_to("? "))),
+        base.color_config
+            .apply(BOLD.apply_to("Enable Vercel Remote Cache for")),
+        base.color_config
+            .apply(BOLD.apply_to(CYAN.apply_to(location))),
+        base.color_config.apply(BOLD.apply_to(" ?"))
     );
 
     Confirm::new()
@@ -512,10 +490,12 @@ fn should_link_spaces(_: &CommandBase, _: &str) -> Result<bool, Error> {
 fn should_link_spaces(base: &CommandBase, location: &str) -> Result<bool, Error> {
     let prompt = format!(
         "{}{} {} {}",
-        base.ui.apply(BOLD.apply_to(GREY.apply_to("? "))),
-        base.ui.apply(BOLD.apply_to("Would you like to link")),
-        base.ui.apply(BOLD.apply_to(CYAN.apply_to(location))),
-        base.ui.apply(BOLD.apply_to("to Vercel Spaces")),
+        base.color_config.apply(BOLD.apply_to(GREY.apply_to("? "))),
+        base.color_config
+            .apply(BOLD.apply_to("Would you like to link")),
+        base.color_config
+            .apply(BOLD.apply_to(CYAN.apply_to(location))),
+        base.color_config.apply(BOLD.apply_to("to Vercel Spaces")),
     );
 
     Confirm::new()
@@ -590,7 +570,7 @@ mod test {
     use anyhow::Result;
     use tempfile::{NamedTempFile, TempDir};
     use turbopath::{AbsoluteSystemPathBuf, AnchoredSystemPath};
-    use turborepo_ui::UI;
+    use turborepo_ui::ColorConfig;
     use turborepo_vercel_api_mock::start_test_server;
 
     use crate::{
@@ -633,7 +613,7 @@ mod test {
                 AbsoluteSystemPathBuf::try_from(user_config_file.path().to_path_buf()).unwrap(),
             ),
             repo_root: repo_root.clone(),
-            ui: UI::new(false),
+            color_config: ColorConfig::new(false),
             config: OnceCell::new(),
             args: Args::default(),
             version: "",
@@ -699,7 +679,7 @@ mod test {
                 AbsoluteSystemPathBuf::try_from(user_config_file.path().to_path_buf()).unwrap(),
             ),
             repo_root: repo_root.clone(),
-            ui: UI::new(false),
+            color_config: ColorConfig::new(false),
             config: OnceCell::new(),
             args: Args::default(),
             version: "",
@@ -720,7 +700,7 @@ mod test {
 
         fs::write(
             turbo_json_file.as_path(),
-            r#"{ "globalEnv": [], "pipeline": {} }"#,
+            r#"{ "globalEnv": [], "tasks": {} }"#,
         )
         .unwrap();
 

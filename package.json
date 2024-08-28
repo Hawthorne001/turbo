@@ -13,6 +13,7 @@
     "docs": "pnpm -- turbo run dev --filter=docs --no-cache",
     "prepare": "husky install",
     "test": "turbo run test",
+    "test:integration": "pnpm --filter turborepo-tests-integration exec prysk",
     "rustdoc": "RUSTDOCFLAGS=\"-Z unstable-options --enable-index-page\" cargo doc --workspace --no-deps --keep-going || true",
     "rustdoc:open": "RUSTDOCFLAGS=\"-Z unstable-options --enable-index-page\" cargo doc --workspace --no-deps --keep-going --open"
   },
@@ -25,9 +26,6 @@
     "prettier": "^2.8.7",
     "semver": "^7.3.8",
     "typescript": "5.3.3"
-  },
-  "optionalDependencies": {
-    "rust": "1.0.6-nightly"
   },
   "lint-staged": {
     "*.{js,jsx,ts,tsx}": [
