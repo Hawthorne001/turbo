@@ -18,7 +18,7 @@
   },
   "devDependencies": {
     "@turbo/eslint-config": "workspace:*",
-    "next": "^15.0.1"
+    "next": "^15.0.3"
   },
   "scripts": {
     "lint": "eslint src/",
