@@ -4874,7 +4874,7 @@ packages:
       '@typescript-eslint/type-utils': 6.18.1(eslint@8.57.1)(typescript@5.3.3)
       '@typescript-eslint/utils': 6.18.1(eslint@8.57.1)(typescript@5.3.3)
       '@typescript-eslint/visitor-keys': 6.18.1
-      debug: 4.3.7
+      debug: 4.3.4
       eslint: 8.57.1
       graphemer: 1.4.0
       ignore: 5.3.0
