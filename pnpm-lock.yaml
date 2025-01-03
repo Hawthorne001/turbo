@@ -4921,7 +4921,7 @@ packages:
       '@typescript-eslint/types': 6.18.1
       '@typescript-eslint/typescript-estree': 6.18.1(typescript@5.3.3)
       '@typescript-eslint/visitor-keys': 6.18.1
-      debug: 4.3.7
+      debug: 4.3.4
       eslint: 8.57.1
       typescript: 5.3.3
     transitivePeerDependencies:
