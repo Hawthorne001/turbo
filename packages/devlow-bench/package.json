@@ -36,7 +36,7 @@
   "dependencies": {
     "@datadog/datadog-api-client": "^1.13.0",
     "chalk": "2.4.2",
-    "inquirer": "^9.2.7",
+    "inquirer": "^10.0.0",
     "minimist": "^1.2.8",
     "pidusage-tree": "^2.0.5",
     "playwright-chromium": "^1.39.0",
